@@ -12,6 +12,7 @@ import (
 	"github.com/daniel-butler/rss-graph/pkg/feed"
 	"github.com/daniel-butler/rss-graph/pkg/fetcher"
 	"github.com/daniel-butler/rss-graph/pkg/graph"
+	"github.com/daniel-butler/rss-graph/pkg/miniflux"
 )
 
 var Version = "dev"
@@ -52,6 +53,10 @@ func run(args []string) error {
 		return cmdRank(fs, args[1:], dbPath)
 	case "links":
 		return cmdLinks(fs, args[1:], dbPath)
+	case "import":
+		return cmdImport(fs, args[1:], dbPath)
+	case "crawl":
+		return cmdCrawl(fs, args[1:], dbPath)
 	case "version":
 		fmt.Println(Version)
 		return nil
@@ -71,11 +76,17 @@ Commands:
   scan <url>    Fetch feed and extract outbound links
   rank          Show feeds ranked by inbound links
   links <url>   Show links to/from a feed
+  import        Import feeds from Miniflux
+  crawl         Import and scan all feeds from Miniflux
   version       Show version
   help          Show this help
 
 Options:
-  -db <path>    SQLite database path (default: ~/.rss-graph/graph.db)`)
+  -db <path>    SQLite database path (default: ~/.rss-graph/graph.db)
+
+Environment:
+  MINIFLUX_URL      Miniflux server URL
+  MINIFLUX_API_KEY  Miniflux API key`)
 }
 
 func defaultDBPath() string {
@@ -298,3 +309,125 @@ func normalizeToFeedURL(rawURL string) string {
 
 // Ensure extractor is imported (used by feed package)
 var _ = extractor.Link{}
+
+func cmdImport(fs *flag.FlagSet, args []string, dbPath *string) error {
+	minifluxURL := fs.String("url", os.Getenv("MINIFLUX_URL"), "Miniflux server URL")
+	apiKey := fs.String("api-key", os.Getenv("MINIFLUX_API_KEY"), "Miniflux API key")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *minifluxURL == "" || *apiKey == "" {
+		return fmt.Errorf("MINIFLUX_URL and MINIFLUX_API_KEY required (env or flags)")
+	}
+
+	g, err := ensureDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+
+	client := miniflux.NewClient(*minifluxURL, *apiKey)
+	feeds, err := client.GetFeeds()
+	if err != nil {
+		return fmt.Errorf("fetching feeds from Miniflux: %w", err)
+	}
+
+	fmt.Printf("Importing %d feeds from Miniflux...\n", len(feeds))
+	for _, f := range feeds {
+		_, err := g.AddFeed(&graph.FeedNode{
+			URL:   f.FeedURL,
+			Title: f.Title,
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to add %s: %v\n", f.FeedURL, err)
+			continue
+		}
+		fmt.Printf("  + %s\n", f.Title)
+	}
+
+	fmt.Printf("Imported %d feeds.\n", len(feeds))
+	return nil
+}
+
+func cmdCrawl(fs *flag.FlagSet, args []string, dbPath *string) error {
+	minifluxURL := fs.String("url", os.Getenv("MINIFLUX_URL"), "Miniflux server URL")
+	apiKey := fs.String("api-key", os.Getenv("MINIFLUX_API_KEY"), "Miniflux API key")
+	entriesPerFeed := fs.Int("entries", 50, "Entries to scan per feed")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *minifluxURL == "" || *apiKey == "" {
+		return fmt.Errorf("MINIFLUX_URL and MINIFLUX_API_KEY required (env or flags)")
+	}
+
+	g, err := ensureDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+
+	client := miniflux.NewClient(*minifluxURL, *apiKey)
+	feeds, err := client.GetFeeds()
+	if err != nil {
+		return fmt.Errorf("fetching feeds from Miniflux: %w", err)
+	}
+
+	fmt.Printf("Crawling %d feeds from Miniflux...\n\n", len(feeds))
+
+	var totalLinks int
+	for _, mf := range feeds {
+		// Add source feed
+		sourceID, err := g.AddFeed(&graph.FeedNode{
+			URL:   mf.FeedURL,
+			Title: mf.Title,
+		})
+		if err != nil {
+			continue
+		}
+
+		// Get entries from Miniflux (already fetched, no need to re-fetch)
+		entries, err := client.GetEntries(mf.ID, *entriesPerFeed)
+		if err != nil {
+			fmt.Printf("  Warning: failed to get entries for %s: %v\n", mf.Title, err)
+			continue
+		}
+
+		feedLinks := 0
+		for _, entry := range entries {
+			// Extract links from entry content
+			links := extractor.ExtractLinks(entry.Content)
+			for _, link := range links {
+				if isSameDomain(mf.SiteURL, link.URL) {
+					continue
+				}
+
+				targetURL := normalizeToFeedURL(link.URL)
+				targetID, err := g.AddFeed(&graph.FeedNode{
+					URL:   targetURL,
+					Title: link.Text,
+				})
+				if err != nil {
+					continue
+				}
+
+				err = g.AddLink(&graph.LinkEdge{
+					SourceID:  sourceID,
+					TargetID:  targetID,
+					Context:   link.Text,
+					PostURL:   entry.URL,
+					PostTitle: entry.Title,
+				})
+				if err == nil {
+					feedLinks++
+				}
+			}
+		}
+		totalLinks += feedLinks
+		fmt.Printf("  %s: %d entries, %d links\n", mf.Title, len(entries), feedLinks)
+	}
+
+	fmt.Printf("\nTotal: %d feeds crawled, %d outbound links found\n", len(feeds), totalLinks)
+	return nil
+}
