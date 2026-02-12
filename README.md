@@ -93,9 +93,42 @@ rss-graph/
 
 MIT
 
+## Miniflux Integration
+
+If you use [Miniflux](https://miniflux.app/) as your RSS reader, you can import your subscriptions directly:
+
+```bash
+export MINIFLUX_URL=https://your-miniflux-instance.com
+export MINIFLUX_API_KEY=your-api-key
+
+# Import all feeds
+rss-graph import
+
+# Import AND crawl entries for links (builds the graph)
+rss-graph crawl
+```
+
+Get your API key from Miniflux: Settings → API Keys → Create API Key
+
+### Running Miniflux with Docker
+
+If you don't have Miniflux yet:
+
+```bash
+docker run -d \
+  --name miniflux \
+  -p 8080:8080 \
+  -e DATABASE_URL="user=miniflux password=secret dbname=miniflux sslmode=disable" \
+  -e RUN_MIGRATIONS=1 \
+  -e CREATE_ADMIN=1 \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=admin123 \
+  miniflux/miniflux:latest
+```
+
 ## Ideas for Future
 
-- [ ] Miniflux integration (import existing subscriptions)
+- [x] Miniflux integration (import existing subscriptions)
 - [ ] OPML import/export
 - [ ] Web UI for exploring the graph
 - [ ] Feed health checks (detect stale feeds)
