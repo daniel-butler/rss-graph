@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      
+      - name: Run tests
+        run: go test -v -race ./...
+      
+      - name: Build
+        run: go build -o rss-graph ./cmd/rss-graph/
+
+  release:
+    name: Release
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      
+      - name: Calculate version
+        id: version
+        run: |
+          DATE=$(date -u +%Y.%m.%d)
+          # Count existing tags for today (with v prefix)
+          COUNT=$(git tag -l "v${DATE}-*" 2>/dev/null | wc -l)
+          NEXT_COUNT=$((COUNT + 1))
+          VERSION="${DATE}-${NEXT_COUNT}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Calculated version: v${VERSION}"
+      
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          PLATFORMS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          for platform in $PLATFORMS; do
+            GOOS="${platform%/*}"
+            GOARCH="${platform#*/}"
+            output_name="rss-graph-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              output_name="${output_name}.exe"
+            fi
+            echo "Building for $GOOS/$GOARCH..."
+            GOOS=$GOOS GOARCH=$GOARCH go build \
+              -ldflags="-s -w -X main.Version=${VERSION}" \
+              -o "dist/${output_name}" \
+              ./cmd/rss-graph
+          done
+          cd dist && sha256sum * > checksums.txt && cat checksums.txt
+      
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+          
+          cat > /tmp/release-notes.md << 'EOF'
+          ## Downloads
+          Download the binary for your platform below.
+          
+          ## Checksums (SHA256)
+          EOF
+          echo '```' >> /tmp/release-notes.md
+          cat dist/checksums.txt >> /tmp/release-notes.md
+          echo '```' >> /tmp/release-notes.md
+          
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            dist/*
