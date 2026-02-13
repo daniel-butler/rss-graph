@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/daniel-butler/rss-graph/pkg/extractor"
 	"github.com/daniel-butler/rss-graph/pkg/feed"
@@ -60,6 +61,8 @@ func run(args []string) error {
 		return cmdCrawl(fs, args[1:], dbPath)
 	case "mentions":
 		return cmdMentions(fs, args[1:], dbPath)
+	case "snapshot":
+		return cmdSnapshot(fs, args[1:], dbPath)
 	case "version":
 		fmt.Println(Version)
 		return nil
@@ -78,10 +81,17 @@ Commands:
   add <url>     Add a feed to the graph
   scan <url>    Fetch feed and extract outbound links
   rank          Show feeds ranked by inbound links
+                  --new         Show recently added feeds (last 30 days)
+                  --filter      Filter out common domains
   links <url>   Show links to/from a feed
   import        Import feeds from Miniflux
   crawl         Import and scan all feeds from Miniflux
+                  --snapshot    Take a snapshot after crawling
   mentions      Show most-mentioned people/orgs
+                  --rising      Sort by velocity (growth rate)
+  snapshot      Manage velocity snapshots
+                  --list        Show available snapshots
+                  --prune       Remove old snapshots (>90 days)
   version       Show version
   help          Show this help
 
@@ -249,6 +259,8 @@ func isCommonDomain(feedURL string) bool {
 func cmdRank(fs *flag.FlagSet, args []string, dbPath *string) error {
 	limit := fs.Int("n", 20, "Number of results")
 	filterCommon := fs.Bool("filter", false, "Filter out common domains (github, twitter, etc)")
+	showNew := fs.Bool("new", false, "Show recently added feeds (last 30 days)")
+	newDays := fs.Int("days", 30, "Days to consider 'new' (use with --new)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -258,6 +270,31 @@ func cmdRank(fs *flag.FlagSet, args []string, dbPath *string) error {
 		return err
 	}
 	defer g.Close()
+
+	// Show new feeds mode
+	if *showNew {
+		newFeeds, err := g.GetNewFeeds(*newDays, *limit)
+		if err != nil {
+			return err
+		}
+
+		if len(newFeeds) == 0 {
+			fmt.Printf("No feeds added in the last %d days.\n", *newDays)
+			return nil
+		}
+
+		fmt.Printf("🆕 Recently added feeds (last %d days):\n\n", *newDays)
+		for i, r := range newFeeds {
+			title := r.Feed.Title
+			if title == "" {
+				title = "(untitled)"
+			}
+			daysAgo := int(time.Since(r.Feed.CreatedAt).Hours() / 24)
+			fmt.Printf("%2d. [%d links] %s\n    %s\n    Added: %d days ago\n\n", 
+				i+1, r.InboundCount, title, r.Feed.URL, daysAgo)
+		}
+		return nil
+	}
 
 	// Fetch more results if filtering
 	fetchLimit := *limit
@@ -408,6 +445,7 @@ func cmdCrawl(fs *flag.FlagSet, args []string, dbPath *string) error {
 	minifluxURL := fs.String("url", os.Getenv("MINIFLUX_URL"), "Miniflux server URL")
 	apiKey := fs.String("api-key", os.Getenv("MINIFLUX_API_KEY"), "Miniflux API key")
 	entriesPerFeed := fs.Int("entries", 50, "Entries to scan per feed")
+	takeSnapshot := fs.Bool("snapshot", false, "Take a snapshot after crawling (for velocity tracking)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -500,12 +538,25 @@ func cmdCrawl(fs *flag.FlagSet, args []string, dbPath *string) error {
 	}
 
 	fmt.Printf("\nTotal: %d feeds crawled, %d outbound links, %d people mentions\n", len(feeds), totalLinks, totalMentions)
+
+	// Take snapshot if requested
+	if *takeSnapshot {
+		today := time.Now().Format("2006-01-02")
+		n, err := g.TakeSnapshot(today)
+		if err != nil {
+			fmt.Printf("Warning: failed to take snapshot: %v\n", err)
+		} else {
+			fmt.Printf("Snapshot saved: %s (%d entries)\n", today, n)
+		}
+	}
+
 	return nil
 }
 
 func cmdMentions(fs *flag.FlagSet, args []string, dbPath *string) error {
 	limit := fs.Int("n", 30, "Number of results")
 	entityType := fs.String("type", "PERSON", "Entity type (PERSON, ORG)")
+	rising := fs.Bool("rising", false, "Sort by velocity (growth rate)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -516,6 +567,78 @@ func cmdMentions(fs *flag.FlagSet, args []string, dbPath *string) error {
 	}
 	defer g.Close()
 
+	if *rising {
+		// Get available snapshots
+		dates, err := g.GetSnapshotDates()
+		if err != nil {
+			return err
+		}
+		
+		if len(dates) < 2 {
+			fmt.Println("Need at least 2 snapshots for velocity calculation.")
+			fmt.Println("Run 'rss-graph snapshot' after each crawl to build history.")
+			fmt.Println("\nFalling back to standard ranking...")
+			*rising = false
+		} else {
+			currentDate := dates[0]
+			previousDate := dates[1]
+			
+			risingMentions, err := g.GetRisingMentions(*entityType, currentDate, previousDate, *limit)
+			if err != nil {
+				return err
+			}
+
+			if len(risingMentions) == 0 {
+				fmt.Println("No rising mentions found.")
+				return nil
+			}
+
+			fmt.Printf("Rising stars (%ss gaining momentum):\n", strings.ToLower(*entityType))
+			fmt.Printf("Comparing %s vs %s\n\n", currentDate, previousDate)
+
+			// Group by status
+			var hot, rising, new_ []graph.RisingMention
+			for _, m := range risingMentions {
+				switch m.Status {
+				case "hot":
+					hot = append(hot, m)
+				case "rising":
+					rising = append(rising, m)
+				case "new":
+					new_ = append(new_, m)
+				}
+			}
+
+			if len(hot) > 0 {
+				fmt.Println("🔥 HOT")
+				for i, m := range hot {
+					fmt.Printf("%2d. [+%.0f%%] %s (%d → %d mentions)\n", 
+						i+1, m.Velocity*100, m.Name, m.PreviousCount, m.CurrentCount)
+				}
+				fmt.Println()
+			}
+
+			if len(rising) > 0 {
+				fmt.Println("📈 RISING")
+				for i, m := range rising {
+					fmt.Printf("%2d. [+%.0f%%] %s (%d → %d mentions)\n",
+						i+1, m.Velocity*100, m.Name, m.PreviousCount, m.CurrentCount)
+				}
+				fmt.Println()
+			}
+
+			if len(new_) > 0 {
+				fmt.Println("🆕 NEW (first seen this period)")
+				for i, m := range new_ {
+					fmt.Printf("%2d. %s (%d mentions)\n", i+1, m.Name, m.CurrentCount)
+				}
+			}
+
+			return nil
+		}
+	}
+
+	// Standard ranking
 	mentions, err := g.GetMostMentioned(*entityType, *limit)
 	if err != nil {
 		return err
@@ -530,5 +653,55 @@ func cmdMentions(fs *flag.FlagSet, args []string, dbPath *string) error {
 	for i, m := range mentions {
 		fmt.Printf("%2d. [%d mentions] %s\n", i+1, m.MentionCount, m.Name)
 	}
+	return nil
+}
+
+func cmdSnapshot(fs *flag.FlagSet, args []string, dbPath *string) error {
+	list := fs.Bool("list", false, "Show available snapshots")
+	prune := fs.Bool("prune", false, "Remove snapshots older than 90 days")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	g, err := ensureDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+
+	if *list {
+		dates, err := g.GetSnapshotDates()
+		if err != nil {
+			return err
+		}
+		if len(dates) == 0 {
+			fmt.Println("No snapshots yet. Run 'rss-graph snapshot' to create one.")
+			return nil
+		}
+		fmt.Println("Available snapshots:")
+		for _, d := range dates {
+			fmt.Printf("  %s\n", d)
+		}
+		return nil
+	}
+
+	if *prune {
+		// 90 days ago
+		cutoff := time.Now().AddDate(0, 0, -90).Format("2006-01-02")
+		n, err := g.PruneSnapshots(cutoff)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Removed %d old snapshot entries (before %s)\n", n, cutoff)
+		return nil
+	}
+
+	// Take a snapshot
+	today := time.Now().Format("2006-01-02")
+	n, err := g.TakeSnapshot(today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Snapshot saved: %s (%d entries)\n", today, n)
 	return nil
 }

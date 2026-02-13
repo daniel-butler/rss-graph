@@ -57,6 +57,25 @@ type RankedMention struct {
 	MentionCount int
 }
 
+// MentionSnapshot represents a point-in-time count for velocity tracking.
+type MentionSnapshot struct {
+	ID           int64
+	Name         string
+	EntityType   string
+	MentionCount int
+	SnapshotDate string // YYYY-MM-DD
+}
+
+// RisingMention represents a mention with velocity data.
+type RisingMention struct {
+	Name          string
+	EntityType    string
+	CurrentCount  int
+	PreviousCount int
+	Velocity      float64 // (current - previous) / max(previous, 1)
+	Status        string  // "hot", "rising", "new"
+}
+
 // NewGraph creates or opens a graph database.
 func NewGraph(dbPath string) (*Graph, error) {
 	db, err := sql.Open("sqlite", dbPath)
@@ -118,6 +137,18 @@ func (g *Graph) initSchema() error {
 
 		CREATE INDEX IF NOT EXISTS idx_mentions_name ON mentions(name);
 		CREATE INDEX IF NOT EXISTS idx_mentions_source ON mentions(source_id);
+
+		CREATE TABLE IF NOT EXISTS mention_snapshots (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			entity_type TEXT NOT NULL,
+			mention_count INTEGER NOT NULL,
+			snapshot_date DATE NOT NULL,
+			UNIQUE(name, entity_type, snapshot_date)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_snapshots_date ON mention_snapshots(snapshot_date);
+		CREATE INDEX IF NOT EXISTS idx_snapshots_name ON mention_snapshots(name);
 	`
 	_, err := g.db.Exec(schema)
 	return err
@@ -310,4 +341,197 @@ func (g *Graph) GetMentionsByFeed(feedID int64) ([]Mention, error) {
 		mentions = append(mentions, m)
 	}
 	return mentions, rows.Err()
+}
+
+// TakeSnapshot saves the current mention counts as a snapshot for velocity tracking.
+func (g *Graph) TakeSnapshot(date string) (int, error) {
+	// Get all current mention counts and insert as snapshot
+	result, err := g.db.Exec(`
+		INSERT OR REPLACE INTO mention_snapshots (name, entity_type, mention_count, snapshot_date)
+		SELECT name, entity_type, COUNT(*) as mention_count, ?
+		FROM mentions
+		GROUP BY name, entity_type
+	`, date)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
+// GetSnapshotDates returns available snapshot dates.
+func (g *Graph) GetSnapshotDates() ([]string, error) {
+	rows, err := g.db.Query(`
+		SELECT DISTINCT snapshot_date FROM mention_snapshots
+		ORDER BY snapshot_date DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var dates []string
+	for rows.Next() {
+		var date string
+		if err := rows.Scan(&date); err != nil {
+			return nil, err
+		}
+		dates = append(dates, date)
+	}
+	return dates, rows.Err()
+}
+
+// PruneSnapshots removes snapshots older than the given date.
+func (g *Graph) PruneSnapshots(beforeDate string) (int, error) {
+	result, err := g.db.Exec(`DELETE FROM mention_snapshots WHERE snapshot_date < ?`, beforeDate)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
+// GetRisingMentions returns mentions sorted by velocity (growth rate).
+func (g *Graph) GetRisingMentions(entityType string, currentDate, previousDate string, limit int) ([]RisingMention, error) {
+	// Get current counts
+	currentCounts := make(map[string]int)
+	rows, err := g.db.Query(`
+		SELECT name, mention_count FROM mention_snapshots
+		WHERE entity_type = ? AND snapshot_date = ?
+	`, entityType, currentDate)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		currentCounts[name] = count
+	}
+	rows.Close()
+
+	// If no snapshot, use live counts
+	if len(currentCounts) == 0 {
+		liveRows, err := g.db.Query(`
+			SELECT name, COUNT(*) as mention_count FROM mentions
+			WHERE entity_type = ?
+			GROUP BY name
+		`, entityType)
+		if err != nil {
+			return nil, err
+		}
+		for liveRows.Next() {
+			var name string
+			var count int
+			if err := liveRows.Scan(&name, &count); err != nil {
+				liveRows.Close()
+				return nil, err
+			}
+			currentCounts[name] = count
+		}
+		liveRows.Close()
+	}
+
+	// Get previous counts
+	previousCounts := make(map[string]int)
+	rows, err = g.db.Query(`
+		SELECT name, mention_count FROM mention_snapshots
+		WHERE entity_type = ? AND snapshot_date = ?
+	`, entityType, previousDate)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		previousCounts[name] = count
+	}
+	rows.Close()
+
+	// Calculate velocity for each name
+	var results []RisingMention
+	for name, current := range currentCounts {
+		previous := previousCounts[name]
+		
+		var velocity float64
+		var status string
+		
+		if previous == 0 {
+			// New entry
+			velocity = float64(current)
+			status = "new"
+		} else {
+			velocity = float64(current-previous) / float64(previous)
+			if velocity > 1.0 && current >= 3 {
+				status = "hot"
+			} else if velocity > 0.5 {
+				status = "rising"
+			} else {
+				status = ""
+			}
+		}
+
+		// Only include if rising, hot, or new with decent count
+		if status != "" || (status == "new" && current >= 2) {
+			results = append(results, RisingMention{
+				Name:          name,
+				EntityType:    entityType,
+				CurrentCount:  current,
+				PreviousCount: previous,
+				Velocity:      velocity,
+				Status:        status,
+			})
+		}
+	}
+
+	// Sort by velocity descending
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].Velocity > results[i].Velocity {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	// Limit results
+	if len(results) > limit {
+		results = results[:limit]
+	}
+
+	return results, nil
+}
+
+// GetNewFeeds returns feeds added within the last N days.
+func (g *Graph) GetNewFeeds(days int, limit int) ([]RankedFeed, error) {
+	rows, err := g.db.Query(`
+		SELECT f.id, f.url, f.title, f.created_at, COUNT(l.id) as link_count
+		FROM feeds f
+		LEFT JOIN links l ON f.id = l.target_id
+		WHERE f.created_at >= datetime('now', ? || ' days')
+		GROUP BY f.id
+		ORDER BY f.created_at DESC
+		LIMIT ?
+	`, -days, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []RankedFeed
+	for rows.Next() {
+		feed := &FeedNode{}
+		var count int
+		if err := rows.Scan(&feed.ID, &feed.URL, &feed.Title, &feed.CreatedAt, &count); err != nil {
+			return nil, err
+		}
+		results = append(results, RankedFeed{Feed: feed, InboundCount: count})
+	}
+	return results, rows.Err()
 }
