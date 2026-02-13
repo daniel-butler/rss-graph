@@ -214,8 +214,41 @@ func cmdScan(fs *flag.FlagSet, args []string, dbPath *string) error {
 	return nil
 }
 
+// Common domains to filter out when showing rankings
+var commonDomains = []string{
+	"github.com",
+	"twitter.com",
+	"x.com",
+	"youtube.com",
+	"linkedin.com",
+	"huggingface.co",
+	"news.ycombinator.com",
+	"arxiv.org",
+	"nytimes.com",
+	"openai.com",
+	"anthropic.com",
+	"google.com",
+	"medium.com",
+	"substack.com",
+	"podcasts.apple.com",
+	"scholar.google.com",
+	"en.wikipedia.org",
+	"reddit.com",
+	"facebook.com",
+}
+
+func isCommonDomain(feedURL string) bool {
+	for _, domain := range commonDomains {
+		if strings.Contains(feedURL, domain) {
+			return true
+		}
+	}
+	return false
+}
+
 func cmdRank(fs *flag.FlagSet, args []string, dbPath *string) error {
 	limit := fs.Int("n", 20, "Number of results")
+	filterCommon := fs.Bool("filter", false, "Filter out common domains (github, twitter, etc)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -226,7 +259,13 @@ func cmdRank(fs *flag.FlagSet, args []string, dbPath *string) error {
 	}
 	defer g.Close()
 
-	ranked, err := g.GetMostLinked(*limit)
+	// Fetch more results if filtering
+	fetchLimit := *limit
+	if *filterCommon {
+		fetchLimit = *limit * 5
+	}
+
+	ranked, err := g.GetMostLinked(fetchLimit)
 	if err != nil {
 		return err
 	}
@@ -237,12 +276,23 @@ func cmdRank(fs *flag.FlagSet, args []string, dbPath *string) error {
 	}
 
 	fmt.Println("Feeds ranked by inbound links:")
-	for i, r := range ranked {
+	shown := 0
+	for _, r := range ranked {
+		if shown >= *limit {
+			break
+		}
+
+		// Skip common domains if filtering
+		if *filterCommon && isCommonDomain(r.Feed.URL) {
+			continue
+		}
+
 		title := r.Feed.Title
 		if title == "" {
 			title = "(untitled)"
 		}
-		fmt.Printf("%2d. [%d links] %s\n    %s\n", i+1, r.InboundCount, title, r.Feed.URL)
+		shown++
+		fmt.Printf("%2d. [%d links] %s\n    %s\n", shown, r.InboundCount, title, r.Feed.URL)
 	}
 	return nil
 }
