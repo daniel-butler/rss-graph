@@ -38,6 +38,25 @@ type RankedFeed struct {
 	InboundCount int
 }
 
+// Mention represents a person/org mentioned in a feed post.
+type Mention struct {
+	ID           int64
+	SourceID     int64  // Feed that contains the mention
+	Name         string // Normalized name
+	EntityType   string // PERSON, ORG, etc.
+	Context      string // Surrounding text
+	PostURL      string
+	PostTitle    string
+	DiscoveredAt time.Time
+}
+
+// RankedMention represents a name with mention count.
+type RankedMention struct {
+	Name         string
+	EntityType   string
+	MentionCount int
+}
+
 // NewGraph creates or opens a graph database.
 func NewGraph(dbPath string) (*Graph, error) {
 	db, err := sql.Open("sqlite", dbPath)
@@ -83,6 +102,22 @@ func (g *Graph) initSchema() error {
 
 		CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id);
 		CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
+
+		CREATE TABLE IF NOT EXISTS mentions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			entity_type TEXT NOT NULL,
+			context TEXT,
+			post_url TEXT,
+			post_title TEXT,
+			discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (source_id) REFERENCES feeds(id),
+			UNIQUE(source_id, name, post_url)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_mentions_name ON mentions(name);
+		CREATE INDEX IF NOT EXISTS idx_mentions_source ON mentions(source_id);
 	`
 	_, err := g.db.Exec(schema)
 	return err
@@ -212,4 +247,67 @@ func scanLinks(rows *sql.Rows) ([]LinkEdge, error) {
 		links = append(links, link)
 	}
 	return links, rows.Err()
+}
+
+// AddMention adds a mention to the graph.
+func (g *Graph) AddMention(mention *Mention) error {
+	_, err := g.db.Exec(
+		`INSERT OR IGNORE INTO mentions (source_id, name, entity_type, context, post_url, post_title)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		mention.SourceID, mention.Name, mention.EntityType, mention.Context, mention.PostURL, mention.PostTitle,
+	)
+	return err
+}
+
+// GetMostMentioned returns names ranked by mention count.
+func (g *Graph) GetMostMentioned(entityType string, limit int) ([]RankedMention, error) {
+	query := `SELECT name, entity_type, COUNT(*) as mention_count
+		 FROM mentions
+		 WHERE entity_type = ?
+		 GROUP BY name
+		 ORDER BY mention_count DESC
+		 LIMIT ?`
+
+	rows, err := g.db.Query(query, entityType, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []RankedMention
+	for rows.Next() {
+		var r RankedMention
+		if err := rows.Scan(&r.Name, &r.EntityType, &r.MentionCount); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// GetMentionsByFeed returns all mentions from a specific feed.
+func (g *Graph) GetMentionsByFeed(feedID int64) ([]Mention, error) {
+	rows, err := g.db.Query(
+		`SELECT id, source_id, name, entity_type, context, post_url, post_title, discovered_at
+		 FROM mentions WHERE source_id = ?`,
+		feedID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mentions []Mention
+	for rows.Next() {
+		var m Mention
+		var context, postURL, postTitle sql.NullString
+		if err := rows.Scan(&m.ID, &m.SourceID, &m.Name, &m.EntityType, &context, &postURL, &postTitle, &m.DiscoveredAt); err != nil {
+			return nil, err
+		}
+		m.Context = context.String
+		m.PostURL = postURL.String
+		m.PostTitle = postTitle.String
+		mentions = append(mentions, m)
+	}
+	return mentions, rows.Err()
 }

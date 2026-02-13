@@ -13,6 +13,7 @@ import (
 	"github.com/daniel-butler/rss-graph/pkg/fetcher"
 	"github.com/daniel-butler/rss-graph/pkg/graph"
 	"github.com/daniel-butler/rss-graph/pkg/miniflux"
+	"github.com/daniel-butler/rss-graph/pkg/ner"
 )
 
 var Version = "dev"
@@ -57,6 +58,8 @@ func run(args []string) error {
 		return cmdImport(fs, args[1:], dbPath)
 	case "crawl":
 		return cmdCrawl(fs, args[1:], dbPath)
+	case "mentions":
+		return cmdMentions(fs, args[1:], dbPath)
 	case "version":
 		fmt.Println(Version)
 		return nil
@@ -78,6 +81,7 @@ Commands:
   links <url>   Show links to/from a feed
   import        Import feeds from Miniflux
   crawl         Import and scan all feeds from Miniflux
+  mentions      Show most-mentioned people/orgs
   version       Show version
   help          Show this help
 
@@ -376,7 +380,7 @@ func cmdCrawl(fs *flag.FlagSet, args []string, dbPath *string) error {
 
 	fmt.Printf("Crawling %d feeds from Miniflux...\n\n", len(feeds))
 
-	var totalLinks int
+	var totalLinks, totalMentions int
 	for _, mf := range feeds {
 		// Add source feed
 		sourceID, err := g.AddFeed(&graph.FeedNode{
@@ -395,6 +399,7 @@ func cmdCrawl(fs *flag.FlagSet, args []string, dbPath *string) error {
 		}
 
 		feedLinks := 0
+		feedMentions := 0
 		for _, entry := range entries {
 			// Extract links from entry content
 			links := extractor.ExtractLinks(entry.Content)
@@ -423,11 +428,57 @@ func cmdCrawl(fs *flag.FlagSet, args []string, dbPath *string) error {
 					feedLinks++
 				}
 			}
+
+			// Extract people mentions using NER
+			people := ner.ExtractPeople(entry.Content)
+			for _, name := range people {
+				err := g.AddMention(&graph.Mention{
+					SourceID:   sourceID,
+					Name:       name,
+					EntityType: "PERSON",
+					PostURL:    entry.URL,
+					PostTitle:  entry.Title,
+				})
+				if err == nil {
+					feedMentions++
+				}
+			}
 		}
 		totalLinks += feedLinks
-		fmt.Printf("  %s: %d entries, %d links\n", mf.Title, len(entries), feedLinks)
+		totalMentions += feedMentions
+		fmt.Printf("  %s: %d entries, %d links, %d mentions\n", mf.Title, len(entries), feedLinks, feedMentions)
 	}
 
-	fmt.Printf("\nTotal: %d feeds crawled, %d outbound links found\n", len(feeds), totalLinks)
+	fmt.Printf("\nTotal: %d feeds crawled, %d outbound links, %d people mentions\n", len(feeds), totalLinks, totalMentions)
+	return nil
+}
+
+func cmdMentions(fs *flag.FlagSet, args []string, dbPath *string) error {
+	limit := fs.Int("n", 30, "Number of results")
+	entityType := fs.String("type", "PERSON", "Entity type (PERSON, ORG)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	g, err := ensureDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+
+	mentions, err := g.GetMostMentioned(*entityType, *limit)
+	if err != nil {
+		return err
+	}
+
+	if len(mentions) == 0 {
+		fmt.Println("No mentions found. Run 'crawl' first to extract mentions.")
+		return nil
+	}
+
+	fmt.Printf("Most mentioned %ss:\n", strings.ToLower(*entityType))
+	for i, m := range mentions {
+		fmt.Printf("%2d. [%d mentions] %s\n", i+1, m.MentionCount, m.Name)
+	}
 	return nil
 }
